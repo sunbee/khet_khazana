@@ -1,0 +1,112 @@
+# khet_khazana
+
+```sql
+-- =============================================================
+-- KHETKEKHILADI — PROJECT SUMMARY AND LESSONS LEARNED
+-- =============================================================
+--
+-- PROJECT CONTEXT:
+-- Farm management system for a permaculture non-profit
+-- organization. Built on Appsmith (dev: Docker container,
+-- prod: Appsmith Cloud), PostgreSQL (dev: local container,
+-- prod: Neon), GitHub for version control.
+--
+-- =============================================================
+-- WHAT WAS BUILT:
+-- =============================================================
+--
+-- 1. GIT WORKFLOW
+--    - dev branch for development, master for production
+--    - Appsmith controls Git push/pull via its UI
+--    - PRs from dev to master before prod deployment
+--    - master branch protected — no direct pushes
+--
+-- 2. DATABASE SCHEMA
+--    - 9 tables: farms, plots, crop_varieties, app_users,
+--      sowing_records, harvest_records, input_records,
+--      resources, soil_health_records
+--    - ENUMs for categorical fields
+--    - PostGIS for spatial data on farms and plots
+--    - Foreign keys with ON DELETE RESTRICT throughout
+--    - upsert_sowing_record() function for safe upserts
+--
+-- 3. REPORTING VIEWS (4 core views)
+--    - view_plotwise_breakdown_rolling365
+--    - view_plotwise_breakdown_ytd
+--    - view_monthly_trend_rolling365
+--    - view_monthly_trend_ytd
+--
+-- 4. DASHBOARD UI PATTERNS
+--    - NULL handling in Appsmith JS with IIFE pattern
+--    - Three-state indicators: no farm selected,
+--      farm with no records, farm with records
+--    - Colour-coded heatmap for plot performance
+--    - Month-on-month comparison widget
+--
+-- =============================================================
+-- LESSONS LEARNED:
+-- =============================================================
+--
+-- GIT:
+-- L1. Never add files directly to GitHub while Appsmith has
+--     uncommitted changes — creates upstream conflict that
+--     requires force push to resolve
+-- L2. Commit small and often via Appsmith UI before touching
+--     GitHub directly
+-- L3. Keep migration SQL files on local machine only, outside
+--     the repo — mixing them into the Appsmith repo caused
+--     hours of recovery work
+-- L4. Force push from inside Docker container using HTTPS
+--     with personal access token when SSH key is unavailable
+--
+-- SQL:
+-- L5. NULL means no data, 0 means genuine zero — never use
+--     COALESCE to paper over the distinction
+-- L6. LEFT JOIN for plotwise views so all plots appear even
+--     with no harvests; INNER JOIN for monthly trend views
+--     since empty months have no meaning on a chart
+-- L7. ROUND() requires NUMERIC not double precision —
+--     cast DATE_PART() results explicitly
+-- L8. CREATE OR REPLACE VIEW cannot reorder or insert columns
+--     before existing ones — DROP and recreate instead
+-- L9. Targets based on 30000 usable sqft per acre not 43560
+--     total sqft — permaculture plots have paths, compost
+--     areas, structures that reduce productive area
+-- L10. Fix redundant logic in one place — cumulative view
+--      should read from monthly view, not duplicate its CTE
+-- L11. Cumulative target must follow calendar months, not
+--      just months where harvests occurred
+-- L12. Rolling 365 cumulative target counts months from
+--      rolling window start; YTD counts from January —
+--      different reference points, different calculations
+-- L13. SUM(p.acreage) inside GROUP BY changes per month as
+--      plots vary — use a CTE to fix farm acreage once
+--
+-- UI:
+-- L14. Appsmith widget bindings are single expression
+--      evaluators — use IIFE (function(){...})() for
+--      multi-line logic with variables
+-- L15. NULL + " kg" gives "null kg" in JavaScript —
+--      always null-check before string concatenation
+-- L16. NULL >= number is false in JS — show neutral
+--      indicator not red when data is absent
+-- L17. NULLIF(NULLIF(value::TEXT, ''), 'null')::INT
+--      is the standard pattern to safely cast Appsmith
+--      widget values that may be empty or string "null"
+-- L18. Database returns honest values, SQL hardens inputs,
+--      UI translates to human meaning — three distinct
+--      responsibilities, never mix them
+--
+-- NAMING:
+-- L19. Name columns for humans not developers —
+--      percent_of_annual_target not yield_ratio,
+--      harvest_events not harvest_count
+-- L20. Consistent naming across all views —
+--      total_yield, cumulative_yield, monthly_target,
+--      cumulative_target throughout
+-- L21. View names should describe granularity and time
+--      window — view_plotwise_breakdown_ytd is
+--      self-documenting, farm_yield_summary is not
+--
+-- =============================================================
+```
