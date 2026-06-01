@@ -1,0 +1,225 @@
+DROP VIEW IF exists public.view_plotwise_breakdown_rolling365;
+
+CREATE VIEW public.view_plotwise_breakdown_rolling365 AS
+SELECT
+    f.farm_id,
+    f.farm_name,
+    p.plot_id,
+    p.plot_number,
+    p.acreage,
+    count(h.harvest_id) AS harvest_events,
+    sum(h.quantity_harvested) AS total_yield,
+    round((sum(h.quantity_harvested) / NULLIF(p.acreage * 30000, 0))::NUMERIC, 4) AS yield_per_sqft,
+    round((sum(h.quantity_harvested) / NULLIF(p.acreage, 0))::NUMERIC, 2) AS yield_per_acre,
+    p.acreage * 30000 AS annual_target,
+    round((sum(h.quantity_harvested) / NULLIF(p.acreage * 30000, 0) * 100)::NUMERIC, 1) AS percent_of_annual_target
+FROM farms f
+JOIN plots p ON f.farm_id = p.farm_id
+LEFT JOIN harvest_records h
+    ON p.plot_id = h.plot_id
+    AND h.harvest_date >= (CURRENT_DATE - '365 days'::interval)
+WHERE p.is_active = true
+GROUP BY f.farm_id, f.farm_name, p.plot_id, p.plot_number, p.acreage;
+
+-- 222222222222222222222222222222222222222222222222222222222222222222222222
+DROP VIEW IF exists public.view_plotwise_breakdown_ytd;
+
+CREATE VIEW public.view_plotwise_breakdown_ytd AS
+SELECT
+    f.farm_id,
+    f.farm_name,
+    p.plot_id,
+    p.plot_number,
+    p.acreage,
+    count(h.harvest_id) AS harvest_events,
+    sum(h.quantity_harvested) AS total_yield,
+    round((sum(h.quantity_harvested) / NULLIF(p.acreage * 30000, 0))::NUMERIC, 4) AS yield_per_sqft,
+    round((sum(h.quantity_harvested) / NULLIF(p.acreage, 0))::NUMERIC, 2) AS yield_per_acre,
+    p.acreage * 30000 AS annual_target,
+    round(
+        (p.acreage * 30000) *
+        (DATE_PART('doy', CURRENT_DATE) /
+         DATE_PART('doy', DATE_TRUNC('year', CURRENT_DATE) + INTERVAL '1 year' - INTERVAL '1 day'))::NUMERIC
+    , 2) AS prorated_target,
+    round((sum(h.quantity_harvested) / NULLIF(p.acreage * 30000, 0) * 100)::NUMERIC, 1) AS percent_of_annual_target,
+    round(
+        sum(h.quantity_harvested) /
+        NULLIF(
+            (p.acreage * 30000) *
+            (DATE_PART('doy', CURRENT_DATE) /
+             DATE_PART('doy', DATE_TRUNC('year', CURRENT_DATE) + INTERVAL '1 year' - INTERVAL '1 day'))
+        , 0)::NUMERIC * 100
+    , 1) AS percent_of_prorated_target
+FROM farms f
+JOIN plots p ON f.farm_id = p.farm_id
+LEFT JOIN harvest_records h
+    ON p.plot_id = h.plot_id
+    AND date_trunc('year', h.harvest_date) = date_trunc('year', CURRENT_DATE)
+WHERE p.is_active = true
+GROUP BY f.farm_id, f.farm_name, p.plot_id, p.plot_number, p.acreage,
+         date_trunc('year', h.harvest_date)::date;
+
+-- 333333333333333333333333333333333333333333333333333333333333333333333333
+DROP VIEW IF exists public.view_monthly_trend_rolling365;
+
+CREATE VIEW public.view_monthly_trend_rolling365 AS
+WITH farm_acreage AS (
+    SELECT
+        farm_id,
+        SUM(acreage) * 30000 AS annual_target,
+        SUM(acreage) * 30000 / 12 AS monthly_target
+    FROM plots
+    WHERE is_active = true
+    GROUP BY farm_id
+),
+monthly_data AS (
+    SELECT
+        f.farm_id,
+        f.farm_name,
+        date_trunc('month', h.harvest_date::timestamp with time zone)::date AS month,
+        sum(h.quantity_harvested) AS total_yield,
+        fa.monthly_target,
+        fa.annual_target
+    FROM harvest_records h
+    JOIN plots p ON h.plot_id = p.plot_id
+    JOIN farms f ON p.farm_id = f.farm_id
+    JOIN farm_acreage fa ON f.farm_id = fa.farm_id
+    WHERE h.harvest_date >= (CURRENT_DATE - '365 days'::interval)
+    GROUP BY f.farm_id, f.farm_name,
+             date_trunc('month', h.harvest_date::timestamp with time zone)::date,
+             fa.monthly_target, fa.annual_target
+)
+SELECT
+    farm_id,
+    farm_name,
+    month,
+    total_yield,
+    sum(total_yield) OVER (
+        PARTITION BY farm_id ORDER BY month
+    ) AS cumulative_yield,
+    monthly_target,
+    round((monthly_target * (
+        EXTRACT(year FROM age(month, date_trunc('month', CURRENT_DATE - INTERVAL '365 days')::date)) * 12 +
+        EXTRACT(month FROM age(month, date_trunc('month', CURRENT_DATE - INTERVAL '365 days')::date)) + 1
+    ))::NUMERIC, 2) AS cumulative_target,
+    -- cumulative yield vs full annual target
+    round(
+        sum(total_yield) OVER (PARTITION BY farm_id ORDER BY month) /
+        NULLIF(annual_target, 0) * 100
+    ::NUMERIC, 1) AS percent_of_annual_target,
+    -- cumulative yield vs expected cumulative target for months elapsed
+    round(
+        sum(total_yield) OVER (PARTITION BY farm_id ORDER BY month) /
+        NULLIF(monthly_target * (
+            EXTRACT(year FROM age(month, date_trunc('month', CURRENT_DATE - INTERVAL '365 days')::date)) * 12 +
+            EXTRACT(month FROM age(month, date_trunc('month', CURRENT_DATE - INTERVAL '365 days')::date)) + 1
+        ), 0) * 100
+    ::NUMERIC, 1) AS percent_of_prorated_target
+FROM monthly_data
+ORDER BY farm_id, month;
+
+-- 444444444444444444444444444444444444444444444444444444444444444444444444
+DROP VIEW IF EXISTS public.view_monthly_trend_ytd;
+
+CREATE VIEW public.view_monthly_trend_ytd AS
+WITH farm_acreage AS (
+    SELECT
+        farm_id,
+        SUM(acreage) * 30000 AS annual_target,
+        SUM(acreage) * 30000 / 12 AS monthly_target
+    FROM plots
+    WHERE is_active = true
+    GROUP BY farm_id
+),
+monthly_data AS (
+    SELECT
+        f.farm_id,
+        f.farm_name,
+        date_trunc('month', h.harvest_date::timestamp with time zone)::date AS month,
+        sum(h.quantity_harvested) AS total_yield,
+        fa.monthly_target,
+        fa.annual_target
+    FROM harvest_records h
+    JOIN plots p ON h.plot_id = p.plot_id
+    JOIN farms f ON p.farm_id = f.farm_id
+    JOIN farm_acreage fa ON f.farm_id = fa.farm_id
+    WHERE h.harvest_date >= DATE_TRUNC('year', CURRENT_DATE)
+    GROUP BY f.farm_id, f.farm_name,
+             date_trunc('month', h.harvest_date::timestamp with time zone)::date,
+             fa.monthly_target, fa.annual_target
+)
+SELECT
+    farm_id,
+    farm_name,
+    month,
+    total_yield,
+    sum(total_yield) OVER (
+        PARTITION BY farm_id ORDER BY month
+    ) AS cumulative_yield,
+    monthly_target,
+    round((monthly_target * EXTRACT(month FROM month))::NUMERIC, 2) AS cumulative_target,
+    -- cumulative yield vs full annual target
+    round(
+        sum(total_yield) OVER (PARTITION BY farm_id ORDER BY month) /
+        NULLIF(annual_target, 0) * 100
+    ::NUMERIC, 1) AS percent_of_annual_target,
+    -- cumulative yield vs expected cumulative target for months elapsed
+    round(
+        sum(total_yield) OVER (PARTITION BY farm_id ORDER BY month) /
+        NULLIF(monthly_target * EXTRACT(month FROM month), 0) * 100
+    ::NUMERIC, 1) AS percent_of_prorated_target
+FROM monthly_data
+ORDER BY farm_id, month;
+
+-- =============================================================
+-- KHETKEKHILADI REPORTING VIEWS
+-- =============================================================
+--
+-- COVERAGE MAP:
+--
+--                    ROLLING 365              YTD
+--                    -----------              ---
+-- Farm total         SUM() on                 SUM() on
+--                    view_plotwise_           view_plotwise_
+--                    breakdown_rolling365     breakdown_ytd
+--                    in Appsmith              in Appsmith
+--
+-- Plot breakdown     view_plotwise_           view_plotwise_
+--                    breakdown_rolling365     breakdown_ytd
+--
+-- Monthly trend      view_monthly_            view_monthly_
+--                    trend_rolling365         trend_ytd
+--
+-- Operational        planting_pulse           —
+-- status
+--
+-- Input efficiency   plot_input_efficiency    —
+--
+-- =============================================================
+-- DESIGN PRINCIPLES:
+-- 1. NULL means no data, 0 means genuine zero yield
+-- 2. LEFT JOIN on plotwise views — all plots appear even
+--    with no harvests
+-- 3. INNER JOIN on monthly trend views — only months with
+--    harvests appear on trend charts
+-- 4. Targets based on 30000 usable sqft per acre
+-- 5. Farm totals computed in Appsmith via SUM, no dedicated
+--    farm total view needed
+-- =============================================================
+
+SELECT viewname, definition 
+FROM pg_views 
+WHERE schemaname = 'public'
+AND definition LIKE '%43560%';
+
+SELECT viewname 
+FROM pg_views 
+WHERE schemaname = 'public'
+ORDER BY viewname;
+
+DROP VIEW IF EXISTS public.farm_yield_rolling_365;
+DROP VIEW IF EXISTS public.farm_yield_summary;
+DROP VIEW IF EXISTS public.farm_monthly_yield_rolling;
+DROP VIEW IF EXISTS public.farm_cumulative_yield_rolling;
+DROP VIEW IF EXISTS public.plot_yield_ytd;
+
