@@ -1,0 +1,243 @@
+```sql
+-- =============================================================
+-- KHETKEKHILADI CHANGELOG
+-- =============================================================
+--
+-- VERSION 1.0 — INITIAL SCHEMA
+-- -------------------------------------------------------------
+-- Created core tables:
+--   farms, plots, crop_varieties, app_users,
+--   sowing_records, harvest_records, input_records,
+--   resources, soil_health_records
+--
+-- ENUMs for categorical fields:
+--   crop_category_enum, farming_type_enum,
+--   irrigation_type_enum, planting_status_enum,
+--   quantity_unit_enum, resource_type_enum, user_role
+--
+-- PostGIS geometry columns on farms and plots for
+-- spatial boundaries and location tracking.
+--
+-- Foreign keys with ON DELETE RESTRICT throughout
+-- to prevent orphaned records.
+--
+-- upsert_sowing_record() function for safe insert/update
+-- of sowing records from Appsmith UI.
+--
+-- =============================================================
+-- VERSION 1.1 — INITIAL VIEWS
+-- -------------------------------------------------------------
+-- Added 5 reporting views:
+--   farm_yield_rolling_365   — plot breakdown, rolling 365
+--   farm_yield_summary       — plot breakdown, yearly
+--   farm_monthly_yield_rolling — monthly trend, rolling 365
+--   farm_cumulative_yield_rolling — cumulative, rolling 365
+--   plot_yield_ytd           — plot vs prorated target, YTD
+--
+-- ISSUES IDENTIFIED LATER:
+--   - farm_yield_rolling_365 used COALESCE giving 0 for
+--     no-harvest plots instead of honest NULL
+--   - farm_yield_summary used inner JOIN losing plots
+--     with no harvests entirely
+--   - farm_cumulative_yield_rolling duplicated entire
+--     CTE from farm_monthly_yield_rolling
+--   - All views used 43560 sqft per acre — incorrect for
+--     permaculture where usable area is ~30000 sqft
+--   - Inconsistent column naming across views
+--   - farm_monthly_yield_rolling and
+--     farm_cumulative_yield_rolling missing farm_id column
+--
+-- =============================================================
+-- VERSION 1.2 — VIEW FIXES
+-- -------------------------------------------------------------
+-- CHANGE: Added farm_id to farm_monthly_yield_rolling
+-- WHY: Cannot filter by farm without farm_id in view.
+--      Required DROP and recreate since farm_id added
+--      before existing columns — CREATE OR REPLACE VIEW
+--      cannot reorder columns.
+--
+-- CHANGE: Added farm_id to farm_cumulative_yield_rolling
+-- WHY: Same reason as above.
+--
+-- CHANGE: Rewrote farm_cumulative_yield_rolling to read
+--         from farm_monthly_yield_rolling instead of
+--         duplicating its CTE internally
+-- WHY: Single source of truth — monthly aggregation logic
+--      should live in one place only.
+--
+-- =============================================================
+-- VERSION 1.3 — VIEW RESTRUCTURE
+-- -------------------------------------------------------------
+-- CHANGE: Dropped all 5 original views and replaced with
+--         4 new views following consistent naming convention:
+--
+--   view_plotwise_breakdown_rolling365
+--   view_plotwise_breakdown_ytd
+--   view_monthly_trend_rolling365
+--   view_monthly_trend_ytd
+--
+-- WHY: Original views had overlapping concerns, inconsistent
+--      naming, and mixed design decisions. New structure
+--      maps cleanly to reporting dimensions:
+--
+--                    ROLLING 365         YTD
+--   Farm total        SUM in Appsmith    SUM in Appsmith
+--   Plot breakdown    plotwise_rolling   plotwise_ytd
+--   Monthly trend     monthly_rolling    monthly_ytd
+--
+-- CHANGE: Replaced 43560 sqft/acre with 30000 sqft/acre
+-- WHY: Permaculture plots have paths, compost areas,
+--      structures reducing productive area. 30000 is
+--      the agreed usable area assumption.
+--
+-- CHANGE: Removed COALESCE from all views
+-- WHY: NULL means no data, 0 means genuine zero yield.
+--      These are meaningfully different in farming context.
+--      COALESCE papering over NULL misleads dashboard users
+--      into thinking a crop failed rather than no data exists.
+--
+-- CHANGE: LEFT JOIN on plotwise views, INNER JOIN on
+--         monthly trend views
+-- WHY: Plotwise — all plots must appear even with no
+--      harvests so heatmap shows complete picture.
+--      Monthly trend — only months with harvests are
+--      meaningful chart data points. Empty months
+--      have no place on a trend line.
+--
+-- CHANGE: Fixed farm acreage calculation in monthly views
+--         using CTE instead of SUM(p.acreage) in GROUP BY
+-- WHY: SUM(p.acreage) inside GROUP BY changes per month
+--      as different plots contribute to different months
+--      giving fluctuating monthly target. CTE calculates
+--      fixed farm acreage once giving stable flat target.
+--
+-- CHANGE: Added prorated_target to plotwise YTD view
+-- WHY: Judging a plot against full annual target in May
+--      is unfair — only 4 months have elapsed. Prorated
+--      target = annual_target * (days_elapsed / days_in_year)
+--      accounts for time elapsed. Leap year safe using
+--      DATE_PART('doy') calculation.
+--
+-- CHANGE: Added cumulative_target to monthly trend views
+-- WHY: Chart overlay needs linearly increasing target line
+--      to compare against cumulative yield.
+--      Rolling 365: cumulative_target = monthly_target *
+--      months elapsed since rolling window start.
+--      YTD: cumulative_target = monthly_target *
+--      EXTRACT(month) since January is always month 1.
+--
+-- CHANGE: Added percent_of_annual_target and
+--         percent_of_prorated_target to all views
+-- WHY: Percentage metrics pre-calculated in database
+--      keep UI JS clean and ensure consistent calculation
+--      across all widgets.
+--
+-- =============================================================
+-- VERSION 1.4 — COLUMN NAMING
+-- -------------------------------------------------------------
+-- CHANGE: Standardised column names across all 4 views:
+--
+--   Old                  New
+--   -------------------  --------------------------
+--   total_yield_kg       total_yield
+--   monthly_kg           total_yield
+--   cumulative_kg        cumulative_yield
+--   yield_kg_per_acre    yield_per_acre
+--   yield_kg_per_sqft    yield_per_sqft
+--   target_kg_per_sqft   (removed — redundant)
+--   annual_target_kg     annual_target
+--   prorated_target_kg   prorated_target
+--   yield_ratio          percent_of_annual_target
+--   completion_pct       percent_of_prorated_target
+--   harvest_count        harvest_events
+--
+-- WHY: Column names should be human readable and
+--      self-documenting. Dropping _kg suffix since unit
+--      is known from context. Replacing ratio/completion
+--      with explicit percent_of_annual_target and
+--      percent_of_prorated_target so meaning is
+--      unambiguous to anyone reading the dashboard or query.
+--
+-- =============================================================
+-- VERSION 1.5 — UI QUERY PATTERNS
+-- -------------------------------------------------------------
+-- CHANGE: All Appsmith queries updated to use new view names
+--         and column names.
+--
+-- CHANGE: Month scaffold added to chart queries using
+--         generate_series for continuous 12-month x-axis
+-- WHY: Views return only months with harvest data.
+--      Charts need all 12 months for continuous timeline.
+--      generate_series produces complete month series,
+--      LEFT JOIN fills gaps with 0 for yield,
+--      monthly_target constant across all months.
+--      Presentation-layer concern kept in Appsmith
+--      query not in view.
+--
+-- CHANGE: Cumulative target calculated as
+--         monthly_target * month_number not as window
+--         function sum of monthly targets
+-- WHY: Window sum only accumulates months where harvests
+--      exist giving non-linear target. Month_number based
+--      calculation always increases linearly independent
+--      of harvest data giving honest benchmark.
+--
+-- CHANGE: viewExpectedProgress query retired
+-- WHY: prorated_target now comes directly from
+--      view_plotwise_breakdown_ytd via viewFarmwiseYieldsYTD.
+--      Separate query was redundant duplication.
+--
+-- =============================================================
+-- VERSION 1.6 — UI JS PATTERNS
+-- -------------------------------------------------------------
+-- CHANGE: All widget bindings updated with consistent
+--         three-state null handling:
+--
+--   State 1 — nothing selected:
+--     total_yield NULL, annual_target NULL
+--     Show: "Select a farm", "— kg", "minus" icon
+--
+--   State 2 — farm selected, no records:
+--     total_yield NULL, annual_target has value
+--     Show: "No harvests recorded", "— kg", "minus" icon
+--
+--   State 3 — farm selected, has records:
+--     Both values present
+--     Show: calculated values, arrow icon
+--
+-- CHANGE: All widget bindings use IIFE pattern
+--         (function(){ ... })() for multi-line logic
+-- WHY: Appsmith widget bindings are single expression
+--      evaluators. IIFE allows variables, conditionals,
+--      and return statements.
+--
+-- CHANGE: Removed == 0 checks from null guards
+-- WHY: After removing COALESCE from views, 0 is a genuine
+--      measured value not an artifact. Treating 0 same as
+--      NULL was masking real data.
+--
+-- CHANGE: Heatmap color thresholds based on
+--         percent_of_prorated_target not raw kg
+-- WHY: Raw kg comparison is farm-size dependent.
+--      A small plot at 80% of its prorated target
+--      should be green regardless of absolute kg.
+--      Percentage threshold is farm-size independent.
+--
+--   Thresholds:
+--   >= 100% prorated target  → Deep Green (#166534)
+--   >= 70%  prorated target  → Green      (#22c55e)
+--   >= 40%  prorated target  → Yellow     (#eab308)
+--   <  40%  prorated target  → Red        (#ef4444)
+--   NULL                     → Grey       (#9ca3af)
+--
+-- =============================================================
+-- GIT WORKFLOW NOTE
+-- -------------------------------------------------------------
+-- Migration SQL files are maintained on local machine only,
+-- outside the GitHub repo. Adding files directly to GitHub
+-- while Appsmith has uncommitted changes creates upstream
+-- conflict requiring force push from inside Docker container
+-- to resolve. Appsmith must always commit and push first
+-- before GitHub receives any direct commits.
+-- =============================================================
+```
